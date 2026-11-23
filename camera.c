@@ -6,6 +6,10 @@
 #include <sys/ioctl.h>
 #include <linux/videodev2.h>
 
+static int camera_enumerate_frame_sizes(struct camera_device *camera, uint32_t pixel_format);
+
+static int camera_enumerate_frame_intervals(struct camera_device *camera, uint32_t pixel_format, uint32_t width, uint32_t height);
+
 int camera_open(struct camera_device *camera, const char *device_path)
 {
         if (camera == NULL || device_path == NULL || device_path[0] == '\0')
@@ -14,7 +18,11 @@ int camera_open(struct camera_device *camera, const char *device_path)
                 return -1;
         }
 
-        camera->fd = -1;
+        if (camera->fd >= 0)
+        {
+                fprintf(stderr, "%s Camera is already open.\n", ERROR_PREFIX);
+                return -1;
+        }
 
         camera->fd = open(device_path, O_RDWR);
 
@@ -25,6 +33,7 @@ int camera_open(struct camera_device *camera, const char *device_path)
         }
 
         printf("%s Camera device opened: %s\n", STATUS_PREFIX, device_path);
+
         printf("%s File descriptor: %d\n", STATUS_PREFIX, camera->fd);
 
         return 0;
@@ -60,11 +69,14 @@ int camera_query_capabilities(struct camera_device *camera)
 
         printf("\n========== CAMERA INFORMATION ==========\n");
 
-        printf("Driver       : %s\n", cap.driver);
-        printf("Card         : %s\n", cap.card);
-        printf("Bus Info     : %s\n", cap.bus_info);
+        printf("Driver        : %s\n", cap.driver);
+        printf("Card          : %s\n", cap.card);
+        printf("Bus Info      : %s\n", cap.bus_info);
 
-        printf("Driver Version: %u.%u.%u\n", (cap.version >> 16) & 0xFF, (cap.version >> 8) & 0xFF, cap.version & 0xFF);
+        printf("Driver Version: %u.%u.%u\n",
+               (cap.version >> 16) & 0xFF,
+               (cap.version >> 8) & 0xFF,
+               cap.version & 0xFF);
 
         printf("\n========== DEVICE CAPABILITIES ==========\n");
 
@@ -123,15 +135,21 @@ int camera_enumerate_formats(struct camera_device *camera)
                         perror("ERROR: VIDIOC_ENUM_FMT failed");
                         return -1;
                 }
-		printf("----------------------------------------------\n");
+
+                printf("\n----------------------------------------------\n");
                 printf("Index            : %u\n", fmt.index);
                 printf("Description      : %s\n", fmt.description);
 
                 printf("Pixel Format     : %c%c%c%c\n",
-                       fmt.pixelformat & 0xFF,
-                       (fmt.pixelformat >> 8) & 0xFF,
-                       (fmt.pixelformat >> 16) & 0xFF,
-                       (fmt.pixelformat >> 24) & 0xFF);
+                       (unsigned char)(fmt.pixelformat & 0xFF),
+                       (unsigned char)((fmt.pixelformat >> 8) & 0xFF),
+                       (unsigned char)((fmt.pixelformat >> 16) & 0xFF),
+                       (unsigned char)((fmt.pixelformat >> 24) & 0xFF));
+
+                if (camera_enumerate_frame_sizes(camera, fmt.pixelformat) == -1)
+                {
+                        return -1;
+                }
 
                 index++;
         }
@@ -141,22 +159,18 @@ int camera_enumerate_formats(struct camera_device *camera)
                 fprintf(stderr, "%s No capture formats found.\n", ERROR_PREFIX);
                 return -1;
         }
-	printf("----------------------------------------------\n");
+
+        printf("\n----------------------------------------------\n");
         printf("%s Found %u pixel formats.\n", STATUS_PREFIX, index);
 
         return 0;
 }
 
-int camera_enumerate_frame_sizes(struct camera_device *camera, uint32_t pixel_format)
+static int camera_enumerate_frame_sizes(struct camera_device *camera, uint32_t pixel_format)
 {
         struct v4l2_frmsizeenum size;
         unsigned int index = 0;
-
-        if (camera == NULL || camera->fd < 0)
-        {
-                fprintf(stderr, "%s Invalid camera device.\n", ERROR_PREFIX);
-                return -1;
-        }
+        bool found = false;
 
         printf("\n========== SUPPORTED FRAME SIZES ==========\n");
 
@@ -178,13 +192,21 @@ int camera_enumerate_frame_sizes(struct camera_device *camera, uint32_t pixel_fo
                         return -1;
                 }
 
+                found = true;
+
                 if (size.type == V4L2_FRMSIZE_TYPE_DISCRETE)
                 {
-                        printf("Index %u: %u x %u\n", index, size.discrete.width, size.discrete.height);
+                        printf("\nResolution: %u x %u\n", size.discrete.width, size.discrete.height);
+
+                        if (camera_enumerate_frame_intervals(camera, pixel_format, size.discrete.width, size.discrete.height) == -1)
+                        {
+                                return -1;
+                        }
                 }
                 else if (size.type == V4L2_FRMSIZE_TYPE_STEPWISE)
                 {
-                        printf("Stepwise resolution range:\n");
+                        printf("\nStepwise resolution range:\n");
+
                         printf("Minimum: %u x %u\n", size.stepwise.min_width, size.stepwise.min_height);
 
                         printf("Maximum: %u x %u\n", size.stepwise.max_width, size.stepwise.max_height);
@@ -195,18 +217,24 @@ int camera_enumerate_frame_sizes(struct camera_device *camera, uint32_t pixel_fo
                 }
                 else if (size.type == V4L2_FRMSIZE_TYPE_CONTINUOUS)
                 {
-                        printf("Continuous resolution range:\n");
+                        printf("\nContinuous resolution range:\n");
+
                         printf("Minimum: %u x %u\n", size.stepwise.min_width, size.stepwise.min_height);
 
                         printf("Maximum: %u x %u\n", size.stepwise.max_width, size.stepwise.max_height);
 
                         break;
                 }
+                else
+                {
+                        printf("%s Unknown frame-size type.\n", STATUS_PREFIX);
+                        break;
+                }
 
                 index++;
         }
 
-        if (index == 0 && size.type != V4L2_FRMSIZE_TYPE_STEPWISE && size.type != V4L2_FRMSIZE_TYPE_CONTINUOUS)
+        if (!found)
         {
                 printf("%s No frame sizes reported for this format.\n", STATUS_PREFIX);
         }
@@ -214,20 +242,14 @@ int camera_enumerate_frame_sizes(struct camera_device *camera, uint32_t pixel_fo
         return 0;
 }
 
-int camera_enumerate_frame_intervals(struct camera_device *camera, uint32_t pixel_format, uint32_t width, uint32_t height)
+static int camera_enumerate_frame_intervals(struct camera_device *camera, uint32_t pixel_format, uint32_t width, uint32_t height)
 {
         struct v4l2_frmivalenum interval;
         unsigned int index = 0;
+        bool found = false;
         double fps;
 
-        if (camera == NULL || camera->fd < 0)
-        {
-                fprintf(stderr, "%s Invalid camera device.\n", ERROR_PREFIX);
-                return -1;
-        }
-
-        printf("\n========== SUPPORTED FRAME RATES ==========\n");
-        printf("Resolution: %u x %u\n", width, height);
+        printf("  Supported frame rates:\n");
 
         while (1)
         {
@@ -249,9 +271,11 @@ int camera_enumerate_frame_intervals(struct camera_device *camera, uint32_t pixe
                         return -1;
                 }
 
+                found = true;
+
                 if (interval.type == V4L2_FRMIVAL_TYPE_DISCRETE)
                 {
-                        if (interval.discrete.numerator == 0)
+                        if (interval.discrete.numerator == 0 || interval.discrete.denominator == 0)
                         {
                                 fprintf(stderr, "%s Invalid frame interval.\n", ERROR_PREFIX);
                                 return -1;
@@ -259,11 +283,14 @@ int camera_enumerate_frame_intervals(struct camera_device *camera, uint32_t pixe
 
                         fps = (double)interval.discrete.denominator / interval.discrete.numerator;
 
-                        printf("Index %u: %.2f FPS\n", index, fps);
+                        printf("    Index %u: %.2f FPS\n", index, fps);
                 }
                 else if (interval.type == V4L2_FRMIVAL_TYPE_STEPWISE || interval.type == V4L2_FRMIVAL_TYPE_CONTINUOUS)
                 {
-                        if (interval.stepwise.min.numerator == 0 || interval.stepwise.max.numerator == 0)
+                        if (interval.stepwise.min.numerator == 0 ||
+                            interval.stepwise.min.denominator == 0 ||
+                            interval.stepwise.max.numerator == 0 ||
+                            interval.stepwise.max.denominator == 0)
                         {
                                 fprintf(stderr, "%s Invalid frame interval range.\n", ERROR_PREFIX);
                                 return -1;
@@ -273,27 +300,28 @@ int camera_enumerate_frame_intervals(struct camera_device *camera, uint32_t pixe
 
                         double max_fps = (double)interval.stepwise.min.denominator / interval.stepwise.min.numerator;
 
-                        printf("Minimum FPS: %.2f\n", min_fps);
-                        printf("Maximum FPS: %.2f\n", max_fps);
+                        printf("    Minimum FPS: %.2f\n", min_fps);
+                        printf("    Maximum FPS: %.2f\n", max_fps);
 
                         if (interval.type == V4L2_FRMIVAL_TYPE_STEPWISE)
                         {
-                                printf("Frame interval step: %u/%u seconds\n", interval.stepwise.step.numerator, interval.stepwise.step.denominator);
+                                printf("    Frame interval step: %u/%u seconds\n", interval.stepwise.step.numerator, interval.stepwise.step.denominator);
                         }
 
+                        break;
+                }
+                else
+                {
+                        printf("    %s Unknown frame-interval type.\n", STATUS_PREFIX);
                         break;
                 }
 
                 index++;
         }
 
-        if (index == 0)
+        if (!found)
         {
-                printf("%s No frame intervals reported for this combination.\n", STATUS_PREFIX);
-        }
-        else
-        {
-                printf("%s Found %u discrete frame intervals.\n", STATUS_PREFIX, index);
+                printf("    %s No frame intervals reported.\n", STATUS_PREFIX);
         }
 
         return 0;
