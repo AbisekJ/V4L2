@@ -93,6 +93,60 @@ int camera_query_capabilities(struct camera_device *camera)
         return 0;
 }
 
+int camera_enumerate_formats(struct camera_device *camera)
+{
+        struct v4l2_fmtdesc fmt;
+        unsigned int index = 0;
+
+        if (camera == NULL || camera->fd < 0)
+        {
+                fprintf(stderr, "%s Invalid camera device.\n", ERROR_PREFIX);
+                return -1;
+        }
+
+        printf("\n========== AVAILABLE PIXEL FORMATS ==========\n");
+
+        while (1)
+        {
+                memset(&fmt, 0, sizeof(fmt));
+
+                fmt.index = index;
+                fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+                if (ioctl(camera->fd, VIDIOC_ENUM_FMT, &fmt) == -1)
+                {
+                        if (errno == EINVAL)
+                        {
+                                break;
+                        }
+
+                        perror("ERROR: VIDIOC_ENUM_FMT failed");
+                        return -1;
+                }
+		printf("----------------------------------------------\n");
+                printf("Index            : %u\n", fmt.index);
+                printf("Description      : %s\n", fmt.description);
+
+                printf("Pixel Format     : %c%c%c%c\n",
+                       fmt.pixelformat & 0xFF,
+                       (fmt.pixelformat >> 8) & 0xFF,
+                       (fmt.pixelformat >> 16) & 0xFF,
+                       (fmt.pixelformat >> 24) & 0xFF);
+
+                index++;
+        }
+
+        if (index == 0)
+        {
+                fprintf(stderr, "%s No capture formats found.\n", ERROR_PREFIX);
+                return -1;
+        }
+	printf("----------------------------------------------\n");
+        printf("%s Found %u pixel formats.\n", STATUS_PREFIX, index);
+
+        return 0;
+}
+
 void camera_close(struct camera_device *camera)
 {
         if (camera == NULL || camera->fd < 0)
