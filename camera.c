@@ -214,6 +214,91 @@ int camera_enumerate_frame_sizes(struct camera_device *camera, uint32_t pixel_fo
         return 0;
 }
 
+int camera_enumerate_frame_intervals(struct camera_device *camera, uint32_t pixel_format, uint32_t width, uint32_t height)
+{
+        struct v4l2_frmivalenum interval;
+        unsigned int index = 0;
+        double fps;
+
+        if (camera == NULL || camera->fd < 0)
+        {
+                fprintf(stderr, "%s Invalid camera device.\n", ERROR_PREFIX);
+                return -1;
+        }
+
+        printf("\n========== SUPPORTED FRAME RATES ==========\n");
+        printf("Resolution: %u x %u\n", width, height);
+
+        while (1)
+        {
+                memset(&interval, 0, sizeof(interval));
+
+                interval.index = index;
+                interval.pixel_format = pixel_format;
+                interval.width = width;
+                interval.height = height;
+
+                if (ioctl(camera->fd, VIDIOC_ENUM_FRAMEINTERVALS, &interval) == -1)
+                {
+                        if (errno == EINVAL)
+                        {
+                                break;
+                        }
+
+                        perror("ERROR: VIDIOC_ENUM_FRAMEINTERVALS failed");
+                        return -1;
+                }
+
+                if (interval.type == V4L2_FRMIVAL_TYPE_DISCRETE)
+                {
+                        if (interval.discrete.numerator == 0)
+                        {
+                                fprintf(stderr, "%s Invalid frame interval.\n", ERROR_PREFIX);
+                                return -1;
+                        }
+
+                        fps = (double)interval.discrete.denominator / interval.discrete.numerator;
+
+                        printf("Index %u: %.2f FPS\n", index, fps);
+                }
+                else if (interval.type == V4L2_FRMIVAL_TYPE_STEPWISE || interval.type == V4L2_FRMIVAL_TYPE_CONTINUOUS)
+                {
+                        if (interval.stepwise.min.numerator == 0 || interval.stepwise.max.numerator == 0)
+                        {
+                                fprintf(stderr, "%s Invalid frame interval range.\n", ERROR_PREFIX);
+                                return -1;
+                        }
+
+                        double min_fps = (double)interval.stepwise.max.denominator / interval.stepwise.max.numerator;
+
+                        double max_fps = (double)interval.stepwise.min.denominator / interval.stepwise.min.numerator;
+
+                        printf("Minimum FPS: %.2f\n", min_fps);
+                        printf("Maximum FPS: %.2f\n", max_fps);
+
+                        if (interval.type == V4L2_FRMIVAL_TYPE_STEPWISE)
+                        {
+                                printf("Frame interval step: %u/%u seconds\n", interval.stepwise.step.numerator, interval.stepwise.step.denominator);
+                        }
+
+                        break;
+                }
+
+                index++;
+        }
+
+        if (index == 0)
+        {
+                printf("%s No frame intervals reported for this combination.\n", STATUS_PREFIX);
+        }
+        else
+        {
+                printf("%s Found %u discrete frame intervals.\n", STATUS_PREFIX, index);
+        }
+
+        return 0;
+}
+
 void camera_close(struct camera_device *camera)
 {
         if (camera == NULL || camera->fd < 0)
