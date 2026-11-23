@@ -25,6 +25,12 @@ int main(int argc, char *argv[])
                 return EXIT_FAILURE;
         }
 
+	if (camera_query_capabilities(&camera) == -1)
+	{
+        	camera_close(&camera);
+        	return EXIT_FAILURE;
+	}
+
         camera_close(&camera);
 
         return EXIT_SUCCESS;
