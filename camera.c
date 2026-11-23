@@ -147,6 +147,73 @@ int camera_enumerate_formats(struct camera_device *camera)
         return 0;
 }
 
+int camera_enumerate_frame_sizes(struct camera_device *camera, uint32_t pixel_format)
+{
+        struct v4l2_frmsizeenum size;
+        unsigned int index = 0;
+
+        if (camera == NULL || camera->fd < 0)
+        {
+                fprintf(stderr, "%s Invalid camera device.\n", ERROR_PREFIX);
+                return -1;
+        }
+
+        printf("\n========== SUPPORTED FRAME SIZES ==========\n");
+
+        while (1)
+        {
+                memset(&size, 0, sizeof(size));
+
+                size.index = index;
+                size.pixel_format = pixel_format;
+
+                if (ioctl(camera->fd, VIDIOC_ENUM_FRAMESIZES, &size) == -1)
+                {
+                        if (errno == EINVAL)
+                        {
+                                break;
+                        }
+
+                        perror("ERROR: VIDIOC_ENUM_FRAMESIZES failed");
+                        return -1;
+                }
+
+                if (size.type == V4L2_FRMSIZE_TYPE_DISCRETE)
+                {
+                        printf("Index %u: %u x %u\n", index, size.discrete.width, size.discrete.height);
+                }
+                else if (size.type == V4L2_FRMSIZE_TYPE_STEPWISE)
+                {
+                        printf("Stepwise resolution range:\n");
+                        printf("Minimum: %u x %u\n", size.stepwise.min_width, size.stepwise.min_height);
+
+                        printf("Maximum: %u x %u\n", size.stepwise.max_width, size.stepwise.max_height);
+
+                        printf("Step: %u x %u\n", size.stepwise.step_width, size.stepwise.step_height);
+
+                        break;
+                }
+                else if (size.type == V4L2_FRMSIZE_TYPE_CONTINUOUS)
+                {
+                        printf("Continuous resolution range:\n");
+                        printf("Minimum: %u x %u\n", size.stepwise.min_width, size.stepwise.min_height);
+
+                        printf("Maximum: %u x %u\n", size.stepwise.max_width, size.stepwise.max_height);
+
+                        break;
+                }
+
+                index++;
+        }
+
+        if (index == 0 && size.type != V4L2_FRMSIZE_TYPE_STEPWISE && size.type != V4L2_FRMSIZE_TYPE_CONTINUOUS)
+        {
+                printf("%s No frame sizes reported for this format.\n", STATUS_PREFIX);
+        }
+
+        return 0;
+}
+
 void camera_close(struct camera_device *camera)
 {
         if (camera == NULL || camera->fd < 0)
