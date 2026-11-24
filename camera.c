@@ -8,6 +8,7 @@
 #include <libudev.h>
 #include <sys/mman.h>
 #include <linux/dma-heap.h>
+#include <poll.h>
 
 struct camera_candidate
 {
@@ -37,6 +38,10 @@ static int camera_init_mmap_buffers(struct camera_device *camera, struct camera_
 static int camera_init_userptr_buffers(struct camera_buffer_pool *pool, size_t frame_size);
 static int camera_init_dmabuf_buffers(struct camera_buffer_pool *pool, size_t frame_size);
 static int camera_set_stream_state(struct camera_device *camera, unsigned long request, const char *action_name);
+static int camera_wait_for_frame(struct camera_device *camera);
+static int camera_requeue_single_buffer(struct camera_device *camera, const struct camera_buffer *buffer, const struct v4l2_buffer *dequeued_buf);
+static int camera_write_frame_file(uint32_t frame_index, const void *data, size_t byte_count);
+static int camera_save_captured_frame(const struct camera_buffer *buffer, const struct v4l2_buffer *dequeued_buf, uint32_t frame_index);
 
 // Retry ioctl when interrupted by a signal.
 static int camera_ioctl(int fd, unsigned long request, void *argument)
@@ -1822,6 +1827,262 @@ int camera_stream_off(struct camera_device *camera)
         }
 
         printf("%s Video capture stream stopped (VIDIOC_STREAMOFF).\n", STATUS_PREFIX);
+        return 0;
+}
+
+// Wait for capture buffer readiness with poll(), retrying on EINTR.
+static int camera_wait_for_frame(struct camera_device *camera)
+{
+        struct pollfd pfd;
+        int poll_result;
+
+        if (camera == NULL || camera->fd < 0)
+        {
+                fprintf(stderr, "%s Invalid camera device for poll.\n", ERROR_PREFIX);
+                return -1;
+        }
+
+        memset(&pfd, 0, sizeof(pfd));
+        pfd.fd = camera->fd;
+        pfd.events = POLLIN;
+
+        do
+        {
+                poll_result = poll(&pfd, CAMERA_MIN_FRAME_COUNT, CAMERA_POLL_TIMEOUT_MS);
+        }
+        while (poll_result == -1 && errno == EINTR);
+
+        if (poll_result == -1)
+        {
+                perror("ERROR: poll failed while waiting for frame");
+                return -1;
+        }
+
+        if (poll_result == 0)
+        {
+                fprintf(stderr, "%s Timed out waiting for frame after %d ms.\n", ERROR_PREFIX, CAMERA_POLL_TIMEOUT_MS);
+                return -1;
+        }
+
+        if (pfd.revents & (POLLERR | POLLNVAL))
+        {
+                fprintf(stderr, "%s Poll error event on camera file descriptor.\n", ERROR_PREFIX);
+                return -1;
+        }
+
+        return 0;
+}
+
+// Re-queue a single buffer back to the V4L2 capture driver via VIDIOC_QBUF.
+static int camera_requeue_single_buffer(struct camera_device *camera, const struct camera_buffer *buffer, const struct v4l2_buffer *dequeued_buf)
+{
+        struct v4l2_buffer buf;
+
+        if (camera == NULL || camera->fd < 0 || buffer == NULL || dequeued_buf == NULL)
+        {
+                fprintf(stderr, "%s Invalid arguments for re-queueing buffer.\n", ERROR_PREFIX);
+                return -1;
+        }
+
+        memset(&buf, 0, sizeof(buf));
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = buffer->memory;
+        buf.index = dequeued_buf->index;
+
+        if (buffer->memory == V4L2_MEMORY_USERPTR)
+        {
+                buf.m.userptr = (unsigned long)(uintptr_t)buffer->start;
+                buf.length = (__u32)buffer->length;
+        }
+        else if (buffer->memory == V4L2_MEMORY_DMABUF)
+        {
+                buf.m.fd = buffer->dmabuf_fd;
+                buf.length = (__u32)buffer->length;
+        }
+
+        if (camera_ioctl(camera->fd, VIDIOC_QBUF, &buf) == -1)
+        {
+                perror("ERROR: VIDIOC_QBUF failed while re-queueing frame");
+                return -1;
+        }
+
+        return 0;
+}
+
+// Write raw frame bytes to disk for inspection.
+static int camera_write_frame_file(uint32_t frame_index, const void *data, size_t byte_count)
+{
+        char filename[CAMERA_FRAME_PATH_SIZE];
+        FILE *output_file;
+        size_t written;
+
+        if (data == NULL || byte_count == 0)
+        {
+                fprintf(stderr, "%s Invalid frame buffer or zero byte count.\n", ERROR_PREFIX);
+                return -1;
+        }
+
+        snprintf(filename, sizeof(filename), "%s_%04u.%s", CAMERA_FRAME_FILE_PREFIX, frame_index, CAMERA_FRAME_FILE_EXT);
+
+        output_file = fopen(filename, "wb");
+        if (output_file == NULL)
+        {
+                perror("ERROR: Failed to open output frame file");
+                return -1;
+        }
+
+        written = fwrite(data, 1U, byte_count, output_file);
+        if (written != byte_count)
+        {
+                perror("ERROR: Failed to write full frame data");
+                fclose(output_file);
+                return -1;
+        }
+
+        if (fclose(output_file) != 0)
+        {
+                perror("ERROR: Failed to close output frame file");
+                return -1;
+        }
+
+        return 0;
+}
+
+// Extract frame payload safely according to buffer memory type and save to file.
+static int camera_save_captured_frame(const struct camera_buffer *buffer, const struct v4l2_buffer *dequeued_buf, uint32_t frame_index)
+{
+        size_t frame_bytes;
+        void *mapped_ptr = NULL;
+        int write_status = -1;
+
+        if (buffer == NULL || dequeued_buf == NULL || buffer->length == 0)
+        {
+                fprintf(stderr, "%s Invalid buffer metadata for captured frame.\n", ERROR_PREFIX);
+                return -1;
+        }
+
+        frame_bytes = (dequeued_buf->bytesused > 0) ? (size_t)dequeued_buf->bytesused : buffer->length;
+        if (frame_bytes > buffer->length)
+        {
+                frame_bytes = buffer->length;
+        }
+
+        if (buffer->memory == V4L2_MEMORY_MMAP)
+        {
+                if (buffer->start == NULL)
+                {
+                        fprintf(stderr, "%s NULL MMAP pointer for frame %u.\n", ERROR_PREFIX, frame_index);
+                        return -1;
+                }
+
+                write_status = camera_write_frame_file(frame_index, buffer->start, frame_bytes);
+        }
+        else if (buffer->memory == V4L2_MEMORY_USERPTR)
+        {
+                void *user_ptr = (void *)(uintptr_t)dequeued_buf->m.userptr;
+                if (user_ptr == NULL)
+                {
+                        user_ptr = buffer->start;
+                }
+
+                if (user_ptr == NULL)
+                {
+                        fprintf(stderr, "%s NULL USERPTR pointer for frame %u.\n", ERROR_PREFIX, frame_index);
+                        return -1;
+                }
+
+                write_status = camera_write_frame_file(frame_index, user_ptr, frame_bytes);
+        }
+        else if (buffer->memory == V4L2_MEMORY_DMABUF)
+        {
+                if (buffer->dmabuf_fd < 0)
+                {
+                        fprintf(stderr, "%s Invalid DMABUF fd for frame %u.\n", ERROR_PREFIX, frame_index);
+                        return -1;
+                }
+
+                mapped_ptr = mmap(NULL, buffer->length, PROT_READ, MAP_SHARED, buffer->dmabuf_fd, 0);
+                if (mapped_ptr == MAP_FAILED)
+                {
+                        perror("ERROR: mmap failed for DMABUF frame read");
+                        return -1;
+                }
+
+                write_status = camera_write_frame_file(frame_index, mapped_ptr, frame_bytes);
+
+                if (munmap(mapped_ptr, buffer->length) == -1)
+                {
+                        perror("ERROR: munmap failed after DMABUF frame read");
+                        return -1;
+                }
+        }
+        else
+        {
+                fprintf(stderr, "%s Unsupported buffer memory type during capture.\n", ERROR_PREFIX);
+                return -1;
+        }
+
+        return write_status;
+}
+
+// Capture requested number of frames using poll(), VIDIOC_DQBUF, and VIDIOC_QBUF.
+int camera_capture_frames(struct camera_device *camera, const struct camera_capture_config *config, const struct camera_buffer_pool *pool)
+{
+        struct v4l2_buffer buf;
+        uint32_t captured = 0;
+
+        if (camera == NULL || camera->fd < 0 || config == NULL || pool == NULL || pool->buffers == NULL || pool->count == 0)
+        {
+                fprintf(stderr, "%s Invalid arguments for frame capture loop.\n", ERROR_PREFIX);
+                return -1;
+        }
+
+        printf("\n========== FRAME CAPTURE LOOP ==========\n");
+        printf("%s Capturing %u frames...\n", STATUS_PREFIX, config->frame_count);
+
+        while (captured < config->frame_count)
+        {
+                if (camera_wait_for_frame(camera) == -1)
+                {
+                        return -1;
+                }
+
+                memset(&buf, 0, sizeof(buf));
+                buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                buf.memory = pool->buffers[0].memory;
+
+                if (buf.memory == V4L2_MEMORY_USERPTR || buf.memory == V4L2_MEMORY_DMABUF)
+                {
+                        buf.length = (__u32)pool->buffers[0].length;
+                }
+
+                if (camera_ioctl(camera->fd, VIDIOC_DQBUF, &buf) == -1)
+                {
+                        perror("ERROR: VIDIOC_DQBUF failed");
+                        return -1;
+                }
+
+                if (buf.index >= pool->count)
+                {
+                        fprintf(stderr, "%s Dequeued buffer index %u out of range (%u).\n", ERROR_PREFIX, buf.index, pool->count);
+                        return -1;
+                }
+
+                if (camera_save_captured_frame(&pool->buffers[buf.index], &buf, captured) == -1)
+                {
+                        return -1;
+                }
+
+                captured++;
+                printf("%s Captured frame %u / %u (buffer index %u, %u bytes).\n", STATUS_PREFIX, captured, config->frame_count, buf.index, buf.bytesused);
+
+                if (camera_requeue_single_buffer(camera, &pool->buffers[buf.index], &buf) == -1)
+                {
+                        return -1;
+                }
+        }
+
+        printf("%s Frame capture completed (%u frames captured).\n", STATUS_PREFIX, captured);
         return 0;
 }
 

@@ -61,6 +61,7 @@ void camera_release_buffers(struct camera_buffer_pool *pool);
 int camera_queue_all_buffers(struct camera_device *camera, const struct camera_buffer_pool *pool);
 int camera_stream_on(struct camera_device *camera);
 int camera_stream_off(struct camera_device *camera);
+int camera_capture_frames(struct camera_device *camera, const struct camera_capture_config *config, const struct camera_buffer_pool *pool);
 void camera_close(struct camera_device *camera);
 
 #endif
