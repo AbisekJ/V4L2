@@ -2,20 +2,22 @@
 
 #include <fcntl.h>
 #include <unistd.h>
-#include <time.h>
-#include <glob.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <sys/ioctl.h>
 #include <linux/videodev2.h>
+#include <libudev.h>
+
+struct camera_candidate
+{
+        char path[CAMERA_DEVICE_PATH_SIZE];
+        char name[CAMERA_DEVICE_NAME_SIZE];
+};
 
 static int camera_ioctl(int fd, unsigned long request, void *argument);
-
-static int camera_validate_device(const char *device_path, struct v4l2_capability *cap, uint32_t *effective_caps);
-
+static int camera_validate_device(const char *device_path, uint32_t *capabilities);
 static int camera_enumerate_frame_sizes(struct camera_device *camera, uint32_t pixel_format);
-
 static int camera_enumerate_frame_intervals(struct camera_device *camera, uint32_t pixel_format, uint32_t width, uint32_t height);
-
 
 static int camera_ioctl(int fd, unsigned long request, void *argument)
 {
@@ -30,14 +32,15 @@ static int camera_ioctl(int fd, unsigned long request, void *argument)
         return result;
 }
 
-
-static int camera_validate_device(const char *device_path, struct v4l2_capability *cap, uint32_t *effective_caps)
+static int camera_validate_device(const char *device_path, uint32_t *capabilities)
 {
-        struct stat device_stat;
+        struct stat device_info;
+        struct v4l2_capability capability;
+        uint32_t effective_caps;
         int fd;
         int saved_errno;
 
-        if (device_path == NULL || cap == NULL || effective_caps == NULL)
+        if (device_path == NULL || device_path[0] == '\0' || capabilities == NULL)
         {
                 errno = EINVAL;
                 return -1;
@@ -50,7 +53,7 @@ static int camera_validate_device(const char *device_path, struct v4l2_capabilit
                 return -1;
         }
 
-        if (fstat(fd, &device_stat) == -1)
+        if (fstat(fd, &device_info) == -1)
         {
                 saved_errno = errno;
                 close(fd);
@@ -58,16 +61,16 @@ static int camera_validate_device(const char *device_path, struct v4l2_capabilit
                 return -1;
         }
 
-        if (!S_ISCHR(device_stat.st_mode))
+        if (!S_ISCHR(device_info.st_mode))
         {
                 close(fd);
                 errno = ENODEV;
                 return -1;
         }
 
-        memset(cap, 0, sizeof(*cap));
+        memset(&capability, 0, sizeof(capability));
 
-        if (camera_ioctl(fd, VIDIOC_QUERYCAP, cap) == -1)
+        if (camera_ioctl(fd, VIDIOC_QUERYCAP, &capability) == -1)
         {
                 saved_errno = errno;
                 close(fd);
@@ -75,199 +78,260 @@ static int camera_validate_device(const char *device_path, struct v4l2_capabilit
                 return -1;
         }
 
-        if (cap->capabilities & V4L2_CAP_DEVICE_CAPS)
+        if (capability.capabilities & V4L2_CAP_DEVICE_CAPS)
         {
-                *effective_caps = cap->device_caps;
+                effective_caps = capability.device_caps;
         }
         else
         {
-                *effective_caps = cap->capabilities;
+                effective_caps = capability.capabilities;
         }
 
-        if (!(*effective_caps & V4L2_CAP_VIDEO_CAPTURE))
+        if (!(effective_caps & V4L2_CAP_VIDEO_CAPTURE))
         {
                 close(fd);
-                errno = ENODEV;
+                errno = ENOTSUP;
                 return -1;
         }
+
+        *capabilities = effective_caps;
 
         return fd;
 }
 
-
 int camera_select_device(char *device_path, size_t path_size)
 {
-        glob_t matches;
-        struct v4l2_capability cap;
-        uint32_t effective_caps;
-        size_t *valid_indices;
-        size_t valid_count = 0;
+        struct udev *udev = NULL;
+        struct udev_enumerate *enumerate = NULL;
+        struct udev_list_entry *devices;
+        struct udev_list_entry *entry;
+        struct udev_device *device = NULL;
+        struct camera_candidate *candidates = NULL;
+        const char *syspath;
+        const char *devnode;
+        const char *device_name;
+        size_t candidate_count = 0;
+        size_t path_length;
+        size_t name_length;
         size_t index;
-        size_t selection;
         char input[64];
-        char *endptr;
-        long choice;
+        char *end_pointer;
+        long selection;
+        uint32_t capabilities;
         int fd;
-        int result;
+        int character;
+        int result = -1;
 
         if (device_path == NULL || path_size == 0)
         {
-                fprintf(stderr, "%s Invalid device selection parameters.\n", ERROR_PREFIX);
+                fprintf(stderr, "%s Invalid device path buffer.\n", ERROR_PREFIX);
                 return -1;
         }
 
-        printf("%s Searching for available camera devices...\n", STATUS_PREFIX);
+        udev = udev_new();
 
-        memset(&matches, 0, sizeof(matches));
-
-        result = glob("/dev/video*", 0, NULL, &matches);
-
-        if (result == GLOB_NOMATCH)
+        if (udev == NULL)
         {
-                fprintf(stderr, "%s No video device nodes found.\n", ERROR_PREFIX);
-                globfree(&matches);
+                fprintf(stderr, "%s Failed to initialize libudev.\n", ERROR_PREFIX);
                 return -1;
         }
 
-        if (result != 0)
+        enumerate = udev_enumerate_new(udev);
+
+        if (enumerate == NULL)
         {
-                fprintf(stderr, "%s Failed to discover video devices.\n", ERROR_PREFIX);
-                globfree(&matches);
-                return -1;
+                fprintf(stderr, "%s Failed to create udev enumerator.\n", ERROR_PREFIX);
+                goto cleanup;
         }
 
-        valid_indices = calloc(matches.gl_pathc, sizeof(*valid_indices));
-
-        if (valid_indices == NULL)
+        if (udev_enumerate_add_match_subsystem(enumerate, "video4linux") < 0)
         {
-                perror("ERROR: Failed to allocate device list");
-                globfree(&matches);
-                return -1;
+                fprintf(stderr, "%s Failed to set video4linux subsystem filter.\n", ERROR_PREFIX);
+                goto cleanup;
         }
 
-        for (index = 0; index < matches.gl_pathc; index++)
+        if (udev_enumerate_scan_devices(enumerate) < 0)
         {
-                fd = camera_validate_device(matches.gl_pathv[index], &cap, &effective_caps);
+                fprintf(stderr, "%s Failed to enumerate video4linux devices.\n", ERROR_PREFIX);
+                goto cleanup;
+        }
+
+        devices = udev_enumerate_get_list_entry(enumerate);
+
+        udev_list_entry_foreach(entry, devices)
+        {
+                syspath = udev_list_entry_get_name(entry);
+
+                if (syspath == NULL)
+                {
+                        continue;
+                }
+
+                device = udev_device_new_from_syspath(udev, syspath);
+
+                if (device == NULL)
+                {
+                        continue;
+                }
+
+                devnode = udev_device_get_devnode(device);
+
+                if (devnode == NULL)
+                {
+                        udev_device_unref(device);
+                        device = NULL;
+                        continue;
+                }
+
+                path_length = strlen(devnode);
+
+                if (path_length >= CAMERA_DEVICE_PATH_SIZE)
+                {
+                        udev_device_unref(device);
+                        device = NULL;
+                        continue;
+                }
+
+                fd = camera_validate_device(devnode, &capabilities);
 
                 if (fd == -1)
                 {
+                        udev_device_unref(device);
+                        device = NULL;
                         continue;
                 }
 
                 if (close(fd) == -1)
                 {
-                        perror("ERROR: Failed to close temporary device");
-                        free(valid_indices);
-                        globfree(&matches);
-                        return -1;
+                        perror("ERROR: Failed to close temporary device descriptor");
                 }
 
-                valid_indices[valid_count] = index;
-                valid_count++;
+                struct camera_candidate *new_candidates = realloc(
+                        candidates,
+                        (candidate_count + 1) * sizeof(*candidates));
+
+                if (new_candidates == NULL)
+                {
+                        fprintf(stderr, "%s Memory allocation failed.\n", ERROR_PREFIX);
+                        udev_device_unref(device);
+                        device = NULL;
+                        goto cleanup;
+                }
+
+                candidates = new_candidates;
+
+                strcpy(candidates[candidate_count].path, devnode);
+
+                device_name = udev_device_get_sysattr_value(device, "name");
+
+                if (device_name == NULL || device_name[0] == '\0')
+                {
+                        device_name = "Unknown V4L2 device";
+                }
+
+                name_length = strlen(device_name);
+
+                if (name_length >= CAMERA_DEVICE_NAME_SIZE)
+                {
+                        name_length = CAMERA_DEVICE_NAME_SIZE - 1;
+                }
+
+                memcpy(candidates[candidate_count].name, device_name, name_length);
+                candidates[candidate_count].name[name_length] = '\0';
+
+                candidate_count++;
+
+                udev_device_unref(device);
+                device = NULL;
         }
 
-        if (valid_count == 0)
+        if (candidate_count == 0)
         {
-                fprintf(stderr, "%s No valid V4L2 capture devices found.\n", ERROR_PREFIX);
-                free(valid_indices);
-                globfree(&matches);
-                return -1;
+                fprintf(stderr, "%s No usable V4L2 capture devices found.\n", ERROR_PREFIX);
+                goto cleanup;
         }
 
-        printf("\n========== AVAILABLE CAMERA DEVICES ==========\n");
+        printf("\n========== AVAILABLE CAPTURE DEVICES ==========\n");
 
-        for (index = 0; index < valid_count; index++)
+        for (index = 0; index < candidate_count; index++)
         {
-                fd = camera_validate_device(matches.gl_pathv[valid_indices[index]], &cap, &effective_caps);
-
-                if (fd == -1)
-                {
-                        fprintf(stderr, "%s Device became unavailable during discovery.\n", ERROR_PREFIX);
-                        free(valid_indices);
-                        globfree(&matches);
-                        return -1;
-                }
-
-                printf("\n[%zu] %s\n", index + 1, cap.card);
-                printf("    Device : %s\n", matches.gl_pathv[valid_indices[index]]);
-                printf("    Driver : %s\n", cap.driver);
-                printf("    Bus    : %s\n", cap.bus_info);
-
-                if (close(fd) == -1)
-                {
-                        perror("ERROR: Failed to close temporary device");
-                        free(valid_indices);
-                        globfree(&matches);
-                        return -1;
-                }
+                printf("\n[%zu] %s\n", index + 1, candidates[index].name);
+                printf("    Device node: %s\n", candidates[index].path);
         }
 
-        while (1)
+        printf("\nSelect a camera [1-%zu]: ", candidate_count);
+        fflush(stdout);
+
+        if (fgets(input, sizeof(input), stdin) == NULL)
         {
-                printf("\nSelect a camera device (1-%zu): ", valid_count);
-                fflush(stdout);
-
-                if (fgets(input, sizeof(input), stdin) == NULL)
-                {
-                        fprintf(stderr, "\n%s Failed to read selection.\n", ERROR_PREFIX);
-                        free(valid_indices);
-                        globfree(&matches);
-                        return -1;
-                }
-
-                if (strchr(input, '\n') == NULL && !feof(stdin))
-                {
-                        int character;
-
-                        while ((character = getchar()) != '\n' && character != EOF)
-                        {
-                        }
-
-                        fprintf(stderr, "%s Input is too long. Try again.\n", ERROR_PREFIX);
-                        continue;
-                }
-
-                errno = 0;
-                choice = strtol(input, &endptr, 10);
-
-                while (isspace((unsigned char)*endptr))
-                {
-                        endptr++;
-                }
-
-                if (errno != 0 || endptr == input || *endptr != '\0' || choice < 1 || (unsigned long)choice > valid_count)
-                {
-                        fprintf(stderr, "%s Invalid selection. Try again.\n", ERROR_PREFIX);
-                        continue;
-                }
-
-                selection = (size_t)choice - 1;
-                break;
+                fprintf(stderr, "%s Failed to read device selection.\n", ERROR_PREFIX);
+                goto cleanup;
         }
 
-        if (strlen(matches.gl_pathv[valid_indices[selection]]) >= path_size)
+        if (strchr(input, '\n') == NULL && !feof(stdin))
         {
-                fprintf(stderr, "%s Device path is too long.\n", ERROR_PREFIX);
-                free(valid_indices);
-                globfree(&matches);
-                return -1;
+                while ((character = getchar()) != '\n' && character != EOF)
+                {
+                }
+
+                fprintf(stderr, "%s Selection input is too long.\n", ERROR_PREFIX);
+                goto cleanup;
         }
 
-        strcpy(device_path, matches.gl_pathv[valid_indices[selection]]);
+        errno = 0;
+        selection = strtol(input, &end_pointer, 10);
+
+        while (isspace((unsigned char)*end_pointer))
+        {
+                end_pointer++;
+        }
+
+        if (errno == ERANGE || end_pointer == input || *end_pointer != '\0' ||
+            selection < 1 || (size_t)selection > candidate_count)
+        {
+                fprintf(stderr, "%s Invalid device selection.\n", ERROR_PREFIX);
+                goto cleanup;
+        }
+
+        path_length = strlen(candidates[selection - 1].path);
+
+        if (path_length >= path_size)
+        {
+                fprintf(stderr, "%s Selected device path is too long.\n", ERROR_PREFIX);
+                goto cleanup;
+        }
+
+        strcpy(device_path, candidates[selection - 1].path);
 
         printf("\n%s Selected device: %s\n", STATUS_PREFIX, device_path);
 
-        free(valid_indices);
-        globfree(&matches);
+        result = 0;
 
-        return 0;
+cleanup:
+
+        if (device != NULL)
+        {
+                udev_device_unref(device);
+        }
+
+        free(candidates);
+
+        if (enumerate != NULL)
+        {
+                udev_enumerate_unref(enumerate);
+        }
+
+        if (udev != NULL)
+        {
+                udev_unref(udev);
+        }
+
+        return result;
 }
-
 
 int camera_open(struct camera_device *camera, const char *device_path)
 {
-        struct v4l2_capability cap;
-        uint32_t effective_caps;
+        uint32_t capabilities;
         int fd;
 
         if (camera == NULL || device_path == NULL || device_path[0] == '\0')
@@ -282,27 +346,27 @@ int camera_open(struct camera_device *camera, const char *device_path)
                 return -1;
         }
 
-        fd = camera_validate_device(device_path, &cap, &effective_caps);
+        fd = camera_validate_device(device_path, &capabilities);
 
         if (fd == -1)
         {
-                perror("ERROR: Failed to validate camera device");
+                perror("ERROR: Failed to open or validate camera device");
                 return -1;
         }
 
         camera->fd = fd;
-        camera->capabilities = effective_caps;
+        camera->capabilities = capabilities;
 
-        printf("%s Valid V4L2 capture device opened: %s\n", STATUS_PREFIX, device_path);
+        printf("%s Camera device opened: %s\n", STATUS_PREFIX, device_path);
         printf("%s File descriptor: %d\n", STATUS_PREFIX, camera->fd);
 
         return 0;
 }
 
-
 int camera_query_capabilities(struct camera_device *camera)
 {
-        struct v4l2_capability cap;
+        struct v4l2_capability capability;
+        uint32_t effective_caps;
 
         if (camera == NULL || camera->fd < 0)
         {
@@ -310,43 +374,54 @@ int camera_query_capabilities(struct camera_device *camera)
                 return -1;
         }
 
-        memset(&cap, 0, sizeof(cap));
+        memset(&capability, 0, sizeof(capability));
 
-        if (camera_ioctl(camera->fd, VIDIOC_QUERYCAP, &cap) == -1)
+        if (camera_ioctl(camera->fd, VIDIOC_QUERYCAP, &capability) == -1)
         {
                 perror("ERROR: VIDIOC_QUERYCAP failed");
                 return -1;
         }
 
+        if (capability.capabilities & V4L2_CAP_DEVICE_CAPS)
+        {
+                effective_caps = capability.device_caps;
+        }
+        else
+        {
+                effective_caps = capability.capabilities;
+        }
+
+        camera->capabilities = effective_caps;
+
         printf("\n========== CAMERA INFORMATION ==========\n");
 
-        printf("Driver        : %s\n", cap.driver);
-        printf("Card          : %s\n", cap.card);
-        printf("Bus Info      : %s\n", cap.bus_info);
+        printf("Driver        : %s\n", capability.driver);
+        printf("Card          : %s\n", capability.card);
+        printf("Bus Info      : %s\n", capability.bus_info);
 
         printf("Driver Version: %u.%u.%u\n",
-               (cap.version >> 16) & 0xFF,
-               (cap.version >> 8) & 0xFF,
-               cap.version & 0xFF);
+               (capability.version >> 16) & 0xFF,
+               (capability.version >> 8) & 0xFF,
+               capability.version & 0xFF);
 
         printf("\n========== DEVICE CAPABILITIES ==========\n");
 
-        if (camera->capabilities & V4L2_CAP_VIDEO_CAPTURE)
+        if (effective_caps & V4L2_CAP_VIDEO_CAPTURE)
         {
                 printf("Video Capture: Supported\n");
         }
 
-        if (camera->capabilities & V4L2_CAP_VIDEO_CAPTURE_MPLANE)
+        if (effective_caps & V4L2_CAP_VIDEO_CAPTURE_MPLANE)
         {
-                printf("Video Capture Multiplanar: Supported (not implemented)\n");
+                printf("Video Capture Multiplanar: Supported\n");
         }
 
-        if (camera->capabilities & V4L2_CAP_STREAMING)
+        if (effective_caps & V4L2_CAP_STREAMING)
         {
                 printf("Streaming: Supported\n");
         }
 
-        if (camera->capabilities & V4L2_CAP_READWRITE)
+        if (effective_caps & V4L2_CAP_READWRITE)
         {
                 printf("Read/Write I/O: Supported\n");
         }
@@ -355,7 +430,6 @@ int camera_query_capabilities(struct camera_device *camera)
 
         return 0;
 }
-
 
 int camera_enumerate_formats(struct camera_device *camera)
 {
@@ -418,7 +492,6 @@ int camera_enumerate_formats(struct camera_device *camera)
         return 0;
 }
 
-
 static int camera_enumerate_frame_sizes(struct camera_device *camera, uint32_t pixel_format)
 {
         struct v4l2_frmsizeenum size;
@@ -462,7 +535,6 @@ static int camera_enumerate_frame_sizes(struct camera_device *camera, uint32_t p
                         printf("Minimum: %u x %u\n", size.stepwise.min_width, size.stepwise.min_height);
                         printf("Maximum: %u x %u\n", size.stepwise.max_width, size.stepwise.max_height);
                         printf("Step: %u x %u\n", size.stepwise.step_width, size.stepwise.step_height);
-
                         break;
                 }
                 else if (size.type == V4L2_FRMSIZE_TYPE_CONTINUOUS)
@@ -470,7 +542,6 @@ static int camera_enumerate_frame_sizes(struct camera_device *camera, uint32_t p
                         printf("\nContinuous resolution range:\n");
                         printf("Minimum: %u x %u\n", size.stepwise.min_width, size.stepwise.min_height);
                         printf("Maximum: %u x %u\n", size.stepwise.max_width, size.stepwise.max_height);
-
                         break;
                 }
                 else
@@ -489,7 +560,6 @@ static int camera_enumerate_frame_sizes(struct camera_device *camera, uint32_t p
 
         return 0;
 }
-
 
 static int camera_enumerate_frame_intervals(struct camera_device *camera, uint32_t pixel_format, uint32_t width, uint32_t height)
 {
@@ -576,7 +646,6 @@ static int camera_enumerate_frame_intervals(struct camera_device *camera, uint32
 
         return 0;
 }
-
 
 void camera_close(struct camera_device *camera)
 {

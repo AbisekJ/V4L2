@@ -3,7 +3,8 @@
 
 #include "common.h"
 
-#define CAMERA_DEVICE_PATH_SIZE 256
+#define CAMERA_DEVICE_PATH_SIZE 512
+#define CAMERA_DEVICE_NAME_SIZE 256
 
 struct camera_device
 {
