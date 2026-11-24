@@ -25,6 +25,9 @@ static double camera_fract_to_fps(struct v4l2_fract interval);
 static int camera_get_current_interval(struct camera_device *camera, struct v4l2_fract *current_interval, bool *supports_timeperframe);
 static int camera_set_interval(struct camera_device *camera, struct v4l2_fract target_interval);
 static int camera_select_target_fps_from_range(const struct v4l2_frmivalenum *range, struct v4l2_fract *chosen_interval);
+static const char *camera_io_method_name(enum camera_io_method method);
+static int camera_select_io_method(struct camera_device *camera, enum camera_io_method *selected_method);
+static int camera_select_frame_count(uint32_t *frame_count);
 
 // Retry ioctl when interrupted by a signal.
 static int camera_ioctl(int fd, unsigned long request, void *argument)
@@ -1284,6 +1287,135 @@ int camera_configure_frame_interval(struct camera_device *camera, uint32_t pixel
 cleanup:
         free(discrete_intervals);
         return result;
+}
+
+// Return human-readable label for a capture I/O method.
+static const char *camera_io_method_name(enum camera_io_method method)
+{
+        if (method == CAMERA_IO_MMAP)
+        {
+                return "Memory Mapped I/O (MMAP)";
+        }
+
+        if (method == CAMERA_IO_READWRITE)
+        {
+                return "Read/Write I/O (READWRITE)";
+        }
+
+        return "Unknown I/O method";
+}
+
+// Build supported I/O methods from capabilities and prompt user to select one.
+static int camera_select_io_method(struct camera_device *camera, enum camera_io_method *selected_method)
+{
+        enum camera_io_method supported_methods[CAMERA_IO_READWRITE];
+        size_t supported_count = 0;
+        size_t index;
+        uint32_t choice = 0;
+
+        if (camera == NULL || camera->fd < 0 || selected_method == NULL)
+        {
+                fprintf(stderr, "%s Invalid arguments for I/O method selection.\n", ERROR_PREFIX);
+                return -1;
+        }
+
+        if (camera->capabilities & V4L2_CAP_STREAMING)
+        {
+                supported_methods[supported_count] = CAMERA_IO_MMAP;
+                supported_count++;
+        }
+
+        if (camera->capabilities & V4L2_CAP_READWRITE)
+        {
+                supported_methods[supported_count] = CAMERA_IO_READWRITE;
+                supported_count++;
+        }
+
+        if (supported_count == 0)
+        {
+                fprintf(stderr, "%s Device supports neither streaming (MMAP) nor read/write I/O.\n", ERROR_PREFIX);
+                return -1;
+        }
+
+        printf("\n========== I/O METHOD SELECTION ==========\n");
+        for (index = 0; index < supported_count; index++)
+        {
+                printf("  [%zu] %s\n", index + 1, camera_io_method_name(supported_methods[index]));
+        }
+
+        if (camera_read_number("Select I/O method: ", &choice) == -1)
+        {
+                return -1;
+        }
+
+        if (choice < CAMERA_MIN_FRAME_COUNT || (size_t)choice > supported_count)
+        {
+                fprintf(stderr, "%s Invalid I/O method selection.\n", ERROR_PREFIX);
+                return -1;
+        }
+
+        *selected_method = supported_methods[choice - 1];
+        printf("%s Selected I/O method: %s\n", STATUS_PREFIX, camera_io_method_name(*selected_method));
+        return 0;
+}
+
+// Prompt user for frame count and validate against allowed bounds.
+static int camera_select_frame_count(uint32_t *frame_count)
+{
+        uint32_t count = 0;
+
+        if (frame_count == NULL)
+        {
+                fprintf(stderr, "%s Invalid frame count destination pointer.\n", ERROR_PREFIX);
+                return -1;
+        }
+
+        printf("\n========== FRAME COUNT SELECTION ==========\n");
+        printf("Allowed frame count range: %u to %u\n", CAMERA_MIN_FRAME_COUNT, CAMERA_MAX_FRAME_COUNT);
+
+        if (camera_read_number("Enter number of frames to capture: ", &count) == -1)
+        {
+                return -1;
+        }
+
+        if (count < CAMERA_MIN_FRAME_COUNT || count > CAMERA_MAX_FRAME_COUNT)
+        {
+                fprintf(stderr, "%s Frame count must be between %u and %u.\n", ERROR_PREFIX, CAMERA_MIN_FRAME_COUNT, CAMERA_MAX_FRAME_COUNT);
+                return -1;
+        }
+
+        *frame_count = count;
+        printf("%s Selected frame count: %u\n", STATUS_PREFIX, *frame_count);
+        return 0;
+}
+
+// Configure capture I/O method and frame count after format and interval setup.
+int camera_configure_capture(struct camera_device *camera, struct camera_capture_config *config)
+{
+        enum camera_io_method method = CAMERA_IO_NONE;
+        uint32_t frame_count = 0;
+
+        if (camera == NULL || camera->fd < 0 || config == NULL)
+        {
+                fprintf(stderr, "%s Invalid capture configuration parameters.\n", ERROR_PREFIX);
+                return -1;
+        }
+
+        if (camera_select_io_method(camera, &method) == -1)
+        {
+                return -1;
+        }
+
+        if (camera_select_frame_count(&frame_count) == -1)
+        {
+                return -1;
+        }
+
+        config->io_method = method;
+        config->frame_count = frame_count;
+
+        printf("\n%s Capture settings configured (Method: %s, Frames: %u).\n", STATUS_PREFIX, camera_io_method_name(config->io_method), config->frame_count);
+        return 0;
 }
 
 // Close open camera descriptor and reset device struct fields.

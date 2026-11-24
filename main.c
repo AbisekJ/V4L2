@@ -4,11 +4,14 @@ int main(int argc, char *argv[])
 {
         struct camera_device camera;
         struct v4l2_pix_format applied_format;
+        struct camera_capture_config capture_config;
         char device_path[CAMERA_DEVICE_PATH_SIZE];
 
         camera.fd = -1;
         camera.capabilities = 0;
         memset(&applied_format, 0, sizeof(applied_format));
+        capture_config.io_method = CAMERA_IO_NONE;
+        capture_config.frame_count = 0;
 
         if (argc > 2)
         {
@@ -70,6 +73,12 @@ int main(int argc, char *argv[])
         }
 
         if (camera_configure_frame_interval(&camera, applied_format.pixelformat, applied_format.width, applied_format.height) == -1)
+        {
+                camera_close(&camera);
+                return EXIT_FAILURE;
+        }
+
+        if (camera_configure_capture(&camera, &capture_config) == -1)
         {
                 camera_close(&camera);
                 return EXIT_FAILURE;
