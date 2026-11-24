@@ -58,6 +58,9 @@ int camera_configure_frame_interval(struct camera_device *camera, uint32_t pixel
 int camera_configure_capture(struct camera_device *camera, struct camera_capture_config *config);
 int camera_setup_buffers(struct camera_device *camera, const struct camera_capture_config *config, uint32_t frame_size, struct camera_buffer_pool *pool);
 void camera_release_buffers(struct camera_buffer_pool *pool);
+int camera_queue_all_buffers(struct camera_device *camera, const struct camera_buffer_pool *pool);
+int camera_stream_on(struct camera_device *camera);
+int camera_stream_off(struct camera_device *camera);
 void camera_close(struct camera_device *camera);
 
 #endif

@@ -7,6 +7,7 @@ int main(int argc, char *argv[])
         struct camera_capture_config capture_config;
         struct camera_buffer_pool buffer_pool;
         char device_path[CAMERA_DEVICE_PATH_SIZE];
+        bool streaming_active = false;
 
         camera.fd = -1;
         camera.capabilities = 0;
@@ -92,6 +93,28 @@ int main(int argc, char *argv[])
         {
                 camera_close(&camera);
                 return EXIT_FAILURE;
+        }
+
+        if (camera_queue_all_buffers(&camera, &buffer_pool) == -1)
+        {
+                camera_release_buffers(&buffer_pool);
+                camera_close(&camera);
+                return EXIT_FAILURE;
+        }
+
+        if (camera_stream_on(&camera) == -1)
+        {
+                camera_release_buffers(&buffer_pool);
+                camera_close(&camera);
+                return EXIT_FAILURE;
+        }
+
+        streaming_active = true;
+
+        if (streaming_active)
+        {
+                camera_stream_off(&camera);
+                streaming_active = false;
         }
 
         camera_release_buffers(&buffer_pool);

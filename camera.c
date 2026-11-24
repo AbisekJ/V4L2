@@ -36,6 +36,7 @@ static int camera_request_buffers(struct camera_device *camera, enum v4l2_memory
 static int camera_init_mmap_buffers(struct camera_device *camera, struct camera_buffer_pool *pool);
 static int camera_init_userptr_buffers(struct camera_buffer_pool *pool, size_t frame_size);
 static int camera_init_dmabuf_buffers(struct camera_buffer_pool *pool, size_t frame_size);
+static int camera_set_stream_state(struct camera_device *camera, unsigned long request, const char *action_name);
 
 // Retry ioctl when interrupted by a signal.
 static int camera_ioctl(int fd, unsigned long request, void *argument)
@@ -1721,6 +1722,107 @@ void camera_release_buffers(struct camera_buffer_pool *pool)
         pool->count = 0;
         pool->io_method = CAMERA_IO_NONE;
         printf("%s Buffers released.\n", STATUS_PREFIX);
+}
+
+// Start or stop V4L2 video capture streaming via VIDIOC_STREAMON or VIDIOC_STREAMOFF.
+static int camera_set_stream_state(struct camera_device *camera, unsigned long request, const char *action_name)
+{
+        enum v4l2_buf_type buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+        if (camera == NULL || camera->fd < 0 || action_name == NULL)
+        {
+                fprintf(stderr, "%s Invalid arguments for %s.\n", ERROR_PREFIX, action_name != NULL ? action_name : "stream control");
+                return -1;
+        }
+
+        if (camera_ioctl(camera->fd, request, &buf_type) == -1)
+        {
+                perror(action_name);
+                return -1;
+        }
+
+        return 0;
+}
+
+// Queue every buffer in the buffer pool to the V4L2 capture driver via VIDIOC_QBUF.
+int camera_queue_all_buffers(struct camera_device *camera, const struct camera_buffer_pool *pool)
+{
+        struct v4l2_buffer buf;
+        uint32_t i;
+
+        if (camera == NULL || camera->fd < 0 || pool == NULL || pool->buffers == NULL || pool->count == 0)
+        {
+                fprintf(stderr, "%s Invalid camera or buffer pool for queueing.\n", ERROR_PREFIX);
+                return -1;
+        }
+
+        printf("\n========== BUFFER QUEUEING ==========\n");
+
+        for (i = 0; i < pool->count; i++)
+        {
+                memset(&buf, 0, sizeof(buf));
+                buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                buf.memory = pool->buffers[i].memory;
+                buf.index = pool->buffers[i].index;
+
+                if (pool->buffers[i].memory == V4L2_MEMORY_USERPTR)
+                {
+                        if (pool->buffers[i].start == NULL || pool->buffers[i].length == 0)
+                        {
+                                fprintf(stderr, "%s Invalid USERPTR buffer at index %u.\n", ERROR_PREFIX, i);
+                                return -1;
+                        }
+
+                        buf.m.userptr = (unsigned long)(uintptr_t)pool->buffers[i].start;
+                        buf.length = (__u32)pool->buffers[i].length;
+                }
+                else if (pool->buffers[i].memory == V4L2_MEMORY_DMABUF)
+                {
+                        if (pool->buffers[i].dmabuf_fd < 0 || pool->buffers[i].length == 0)
+                        {
+                                fprintf(stderr, "%s Invalid DMABUF buffer at index %u.\n", ERROR_PREFIX, i);
+                                return -1;
+                        }
+
+                        buf.m.fd = pool->buffers[i].dmabuf_fd;
+                        buf.length = (__u32)pool->buffers[i].length;
+                }
+
+                if (camera_ioctl(camera->fd, VIDIOC_QBUF, &buf) == -1)
+                {
+                        perror("ERROR: VIDIOC_QBUF failed");
+                        return -1;
+                }
+        }
+
+        printf("%s Queued %u buffers successfully.\n", STATUS_PREFIX, pool->count);
+        return 0;
+}
+
+// Start V4L2 capture stream via VIDIOC_STREAMON.
+int camera_stream_on(struct camera_device *camera)
+{
+        printf("\n========== STREAM CONTROL ==========\n");
+
+        if (camera_set_stream_state(camera, VIDIOC_STREAMON, "ERROR: VIDIOC_STREAMON failed") == -1)
+        {
+                return -1;
+        }
+
+        printf("%s Video capture stream started (VIDIOC_STREAMON).\n", STATUS_PREFIX);
+        return 0;
+}
+
+// Stop V4L2 capture stream via VIDIOC_STREAMOFF.
+int camera_stream_off(struct camera_device *camera)
+{
+        if (camera_set_stream_state(camera, VIDIOC_STREAMOFF, "ERROR: VIDIOC_STREAMOFF failed") == -1)
+        {
+                return -1;
+        }
+
+        printf("%s Video capture stream stopped (VIDIOC_STREAMOFF).\n", STATUS_PREFIX);
+        return 0;
 }
 
 // Close open camera descriptor and reset device struct fields.
