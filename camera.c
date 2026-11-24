@@ -18,6 +18,8 @@ static int camera_ioctl(int fd, unsigned long request, void *argument);
 static int camera_validate_device(const char *device_path, uint32_t *capabilities);
 static int camera_enumerate_frame_sizes(struct camera_device *camera, uint32_t pixel_format);
 static int camera_enumerate_frame_intervals(struct camera_device *camera, uint32_t pixel_format, uint32_t width, uint32_t height);
+static int camera_read_number(const char *prompt, uint32_t *value);
+static int camera_validate_resolution(uint32_t width, uint32_t height, const struct v4l2_frmsizeenum *range);
 
 static int camera_ioctl(int fd, unsigned long request, void *argument)
 {
@@ -645,6 +647,359 @@ static int camera_enumerate_frame_intervals(struct camera_device *camera, uint32
         }
 
         return 0;
+}
+
+static int camera_read_number(const char *prompt, uint32_t *value)
+{
+        char input[64];
+        char *end_pointer;
+        unsigned long number;
+        int character;
+
+        if (value == NULL)
+        {
+                errno = EINVAL;
+                return -1;
+        }
+
+        printf("%s", prompt);
+        fflush(stdout);
+
+        if (fgets(input, sizeof(input), stdin) == NULL)
+        {
+                fprintf(stderr, "%s Failed to read input.\n", ERROR_PREFIX);
+                return -1;
+        }
+
+        if (strchr(input, '\n') == NULL && !feof(stdin))
+        {
+                while ((character = getchar()) != '\n' && character != EOF)
+                {
+                }
+
+                fprintf(stderr, "%s Input is too long.\n", ERROR_PREFIX);
+                return -1;
+        }
+
+        errno = 0;
+        number = strtoul(input, &end_pointer, 10);
+
+        while (isspace((unsigned char)*end_pointer))
+        {
+                end_pointer++;
+        }
+
+        if (errno == ERANGE || end_pointer == input || *end_pointer != '\0' ||
+            number > UINT32_MAX)
+        {
+                fprintf(stderr, "%s Invalid numeric input.\n", ERROR_PREFIX);
+                return -1;
+        }
+
+        *value = (uint32_t)number;
+
+        return 0;
+}
+
+static int camera_validate_resolution(uint32_t width, uint32_t height, const struct v4l2_frmsizeenum *range)
+{
+        if (range == NULL || width == 0 || height == 0)
+        {
+                return -1;
+        }
+
+        if (width < range->stepwise.min_width || width > range->stepwise.max_width ||
+            height < range->stepwise.min_height || height > range->stepwise.max_height)
+        {
+                return -1;
+        }
+
+        if (range->type == V4L2_FRMSIZE_TYPE_STEPWISE)
+        {
+                if (range->stepwise.step_width == 0 || range->stepwise.step_height == 0)
+                {
+                        return -1;
+                }
+
+                if ((width - range->stepwise.min_width) % range->stepwise.step_width != 0 ||
+                    (height - range->stepwise.min_height) % range->stepwise.step_height != 0)
+                {
+                        return -1;
+                }
+        }
+
+        return 0;
+}
+
+int camera_configure_format(struct camera_device *camera)
+{
+        struct v4l2_fmtdesc format;
+        struct v4l2_frmsizeenum frame_size;
+        struct v4l2_frmsizeenum frame_size_range;
+        struct v4l2_format selected_format;
+        struct v4l2_frmsizeenum *discrete_sizes = NULL;
+        struct v4l2_frmsizeenum *new_sizes;
+        uint32_t format_selection;
+        uint32_t resolution_selection;
+        uint32_t width;
+        uint32_t height;
+        unsigned int format_index = 0;
+        size_t discrete_count = 0;
+        size_t index;
+        bool range_found = false;
+        int result = -1;
+
+        if (camera == NULL || camera->fd < 0)
+        {
+                fprintf(stderr, "%s Invalid camera device.\n", ERROR_PREFIX);
+                return -1;
+        }
+
+        printf("\n========== PIXEL FORMAT SELECTION ==========\n");
+
+        while (1)
+        {
+                memset(&format, 0, sizeof(format));
+
+                format.index = format_index;
+                format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+                if (camera_ioctl(camera->fd, VIDIOC_ENUM_FMT, &format) == -1)
+                {
+                        if (errno == EINVAL)
+                        {
+                                break;
+                        }
+
+                        perror("ERROR: VIDIOC_ENUM_FMT failed");
+                        goto cleanup;
+                }
+
+                printf("[%u] %s (", format_index, format.description);
+                printf("%c%c%c%c)\n",
+                       (unsigned char)(format.pixelformat & 0xFF),
+                       (unsigned char)((format.pixelformat >> 8) & 0xFF),
+                       (unsigned char)((format.pixelformat >> 16) & 0xFF),
+                       (unsigned char)((format.pixelformat >> 24) & 0xFF));
+
+                format_index++;
+        }
+
+        if (format_index == 0)
+        {
+                fprintf(stderr, "%s No pixel formats available.\n", ERROR_PREFIX);
+                goto cleanup;
+        }
+
+        if (camera_read_number("\nSelect pixel format: ", &format_selection) == -1)
+        {
+                goto cleanup;
+        }
+
+        if (format_selection >= format_index)
+        {
+                fprintf(stderr, "%s Invalid pixel format selection.\n", ERROR_PREFIX);
+                goto cleanup;
+        }
+
+        memset(&format, 0, sizeof(format));
+        format.index = format_selection;
+        format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+        if (camera_ioctl(camera->fd, VIDIOC_ENUM_FMT, &format) == -1)
+        {
+                perror("ERROR: Failed to retrieve selected pixel format");
+                goto cleanup;
+        }
+
+        printf("\n%s Selected pixel format: %s\n", STATUS_PREFIX, format.description);
+
+        printf("\n========== SUPPORTED RESOLUTIONS ==========\n");
+
+        index = 0;
+
+        while (1)
+        {
+                memset(&frame_size, 0, sizeof(frame_size));
+
+                frame_size.index = (unsigned int)index;
+                frame_size.pixel_format = format.pixelformat;
+
+                if (camera_ioctl(camera->fd, VIDIOC_ENUM_FRAMESIZES, &frame_size) == -1)
+                {
+                        if (errno == EINVAL)
+                        {
+                                break;
+                        }
+
+                        perror("ERROR: VIDIOC_ENUM_FRAMESIZES failed");
+                        goto cleanup;
+                }
+
+                if (frame_size.type == V4L2_FRMSIZE_TYPE_DISCRETE)
+                {
+                        new_sizes = realloc(discrete_sizes, (discrete_count + 1) * sizeof(*discrete_sizes));
+
+                        if (new_sizes == NULL)
+                        {
+                                fprintf(stderr, "%s Memory allocation failed.\n", ERROR_PREFIX);
+                                goto cleanup;
+                        }
+
+                        discrete_sizes = new_sizes;
+                        discrete_sizes[discrete_count] = frame_size;
+
+                        printf("[%zu] %u x %u\n",
+                               discrete_count + 1,
+                               frame_size.discrete.width,
+                               frame_size.discrete.height);
+
+                        if (camera_enumerate_frame_intervals(
+                                camera,
+                                format.pixelformat,
+                                frame_size.discrete.width,
+                                frame_size.discrete.height) == -1)
+                        {
+                                goto cleanup;
+                        }
+
+                        discrete_count++;
+                }
+                else if (frame_size.type == V4L2_FRMSIZE_TYPE_STEPWISE ||
+                         frame_size.type == V4L2_FRMSIZE_TYPE_CONTINUOUS)
+                {
+                        frame_size_range = frame_size;
+                        range_found = true;
+
+                        printf("\nCustom resolution range:\n");
+                        printf("Minimum: %u x %u\n",
+                               frame_size.stepwise.min_width,
+                               frame_size.stepwise.min_height);
+                        printf("Maximum: %u x %u\n",
+                               frame_size.stepwise.max_width,
+                               frame_size.stepwise.max_height);
+
+                        if (frame_size.type == V4L2_FRMSIZE_TYPE_STEPWISE)
+                        {
+                                printf("Step: %u x %u\n",
+                                       frame_size.stepwise.step_width,
+                                       frame_size.stepwise.step_height);
+                        }
+
+                }
+
+                index++;
+        }
+
+        if (discrete_count == 0 && !range_found)
+        {
+                fprintf(stderr, "%s No usable resolutions reported.\n", ERROR_PREFIX);
+                goto cleanup;
+        }
+
+        printf("\n========== RESOLUTION SELECTION ==========\n");
+
+        if (discrete_count > 0)
+        {
+                printf("Select a resolution:");
+
+                if (range_found)
+                {
+                        printf("\n[0] Enter a custom resolution");
+                }
+
+                printf("\n");
+
+                if (camera_read_number("Resolution selection: ", &resolution_selection) == -1)
+                {
+                        goto cleanup;
+                }
+
+                if (resolution_selection == 0 && range_found)
+                {
+                        printf("\nEnter the desired resolution.\n");
+
+                        if (camera_read_number("Width: ", &width) == -1 ||
+                            camera_read_number("Height: ", &height) == -1)
+                        {
+                                goto cleanup;
+                        }
+
+                        if (camera_validate_resolution(width, height, &frame_size_range) == -1)
+                        {
+                                fprintf(stderr, "%s Resolution is outside the supported range or step.\n", ERROR_PREFIX);
+                                goto cleanup;
+                        }
+                }
+                else
+                {
+                        if (resolution_selection == 0 || resolution_selection > discrete_count)
+                        {
+                                fprintf(stderr, "%s Invalid resolution selection.\n", ERROR_PREFIX);
+                                goto cleanup;
+                        }
+
+                        width = discrete_sizes[resolution_selection - 1].discrete.width;
+                        height = discrete_sizes[resolution_selection - 1].discrete.height;
+                }
+        }
+        else
+        {
+                printf("\nEnter the desired resolution.\n");
+
+                if (camera_read_number("Width: ", &width) == -1 ||
+                    camera_read_number("Height: ", &height) == -1)
+                {
+                        goto cleanup;
+                }
+
+                if (camera_validate_resolution(width, height, &frame_size_range) == -1)
+                {
+                        fprintf(stderr, "%s Resolution is outside the supported range or step.\n", ERROR_PREFIX);
+                        goto cleanup;
+                }
+        }
+
+        printf("\n%s Requested resolution: %u x %u\n", STATUS_PREFIX, width, height);
+
+        memset(&selected_format, 0, sizeof(selected_format));
+
+        selected_format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        selected_format.fmt.pix.width = width;
+        selected_format.fmt.pix.height = height;
+        selected_format.fmt.pix.pixelformat = format.pixelformat;
+        selected_format.fmt.pix.field = V4L2_FIELD_ANY;
+
+        if (camera_ioctl(camera->fd, VIDIOC_S_FMT, &selected_format) == -1)
+        {
+                perror("ERROR: VIDIOC_S_FMT failed");
+                goto cleanup;
+        }
+
+        printf("\n========== APPLIED CAMERA FORMAT ==========\n");
+
+        printf("Pixel Format : %c%c%c%c\n",
+               (unsigned char)(selected_format.fmt.pix.pixelformat & 0xFF),
+               (unsigned char)((selected_format.fmt.pix.pixelformat >> 8) & 0xFF),
+               (unsigned char)((selected_format.fmt.pix.pixelformat >> 16) & 0xFF),
+               (unsigned char)((selected_format.fmt.pix.pixelformat >> 24) & 0xFF));
+
+        printf("Width        : %u\n", selected_format.fmt.pix.width);
+        printf("Height       : %u\n", selected_format.fmt.pix.height);
+        printf("Bytes/Line   : %u\n", selected_format.fmt.pix.bytesperline);
+        printf("Image Size   : %u bytes\n", selected_format.fmt.pix.sizeimage);
+        printf("Field        : %u\n", selected_format.fmt.pix.field);
+        printf("Colorspace   : %u\n", selected_format.fmt.pix.colorspace);
+
+        printf("\n%s Camera format configured successfully.\n", STATUS_PREFIX);
+
+        result = 0;
+
+cleanup:
+
+        free(discrete_sizes);
+
+        return result;
 }
 
 void camera_close(struct camera_device *camera)

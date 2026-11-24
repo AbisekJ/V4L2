@@ -16,6 +16,7 @@ int camera_select_device(char *device_path, size_t path_size);
 int camera_open(struct camera_device *camera, const char *device_path);
 int camera_query_capabilities(struct camera_device *camera);
 int camera_enumerate_formats(struct camera_device *camera);
+int camera_configure_format(struct camera_device *camera);
 void camera_close(struct camera_device *camera);
 
 #endif
