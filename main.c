@@ -5,6 +5,7 @@ int main(int argc, char *argv[])
         struct camera_device camera;
         struct v4l2_pix_format applied_format;
         struct camera_capture_config capture_config;
+        struct camera_buffer_pool buffer_pool;
         char device_path[CAMERA_DEVICE_PATH_SIZE];
 
         camera.fd = -1;
@@ -12,6 +13,9 @@ int main(int argc, char *argv[])
         memset(&applied_format, 0, sizeof(applied_format));
         capture_config.io_method = CAMERA_IO_NONE;
         capture_config.frame_count = 0;
+        buffer_pool.buffers = NULL;
+        buffer_pool.count = 0;
+        buffer_pool.io_method = CAMERA_IO_NONE;
 
         if (argc > 2)
         {
@@ -84,6 +88,13 @@ int main(int argc, char *argv[])
                 return EXIT_FAILURE;
         }
 
+        if (camera_setup_buffers(&camera, &capture_config, applied_format.sizeimage, &buffer_pool) == -1)
+        {
+                camera_close(&camera);
+                return EXIT_FAILURE;
+        }
+
+        camera_release_buffers(&buffer_pool);
         camera_close(&camera);
         return EXIT_SUCCESS;
 }

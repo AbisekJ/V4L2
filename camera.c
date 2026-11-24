@@ -6,6 +6,8 @@
 #include <sys/ioctl.h>
 #include <linux/videodev2.h>
 #include <libudev.h>
+#include <sys/mman.h>
+#include <linux/dma-heap.h>
 
 struct camera_candidate
 {
@@ -28,6 +30,12 @@ static int camera_select_target_fps_from_range(const struct v4l2_frmivalenum *ra
 static const char *camera_io_method_name(enum camera_io_method method);
 static int camera_select_io_method(struct camera_device *camera, enum camera_io_method *selected_method);
 static int camera_select_frame_count(uint32_t *frame_count);
+static enum v4l2_memory camera_io_to_v4l2_memory(enum camera_io_method method);
+static size_t camera_align_up_size(size_t size, size_t alignment);
+static int camera_request_buffers(struct camera_device *camera, enum v4l2_memory memory, uint32_t *allocated_count);
+static int camera_init_mmap_buffers(struct camera_device *camera, struct camera_buffer_pool *pool);
+static int camera_init_userptr_buffers(struct camera_buffer_pool *pool, size_t frame_size);
+static int camera_init_dmabuf_buffers(struct camera_buffer_pool *pool, size_t frame_size);
 
 // Retry ioctl when interrupted by a signal.
 static int camera_ioctl(int fd, unsigned long request, void *argument)
@@ -1289,7 +1297,7 @@ cleanup:
         return result;
 }
 
-// Return human-readable label for a capture I/O method.
+// Return human-readable label for a streaming I/O method.
 static const char *camera_io_method_name(enum camera_io_method method)
 {
         if (method == CAMERA_IO_MMAP)
@@ -1297,18 +1305,23 @@ static const char *camera_io_method_name(enum camera_io_method method)
                 return "Memory Mapped I/O (MMAP)";
         }
 
-        if (method == CAMERA_IO_READWRITE)
+        if (method == CAMERA_IO_USERPTR)
         {
-                return "Read/Write I/O (READWRITE)";
+                return "User Pointer I/O (USERPTR)";
+        }
+
+        if (method == CAMERA_IO_DMABUF)
+        {
+                return "DMA Buffer I/O (DMABUF)";
         }
 
         return "Unknown I/O method";
 }
 
-// Build supported I/O methods from capabilities and prompt user to select one.
+// Populate supported streaming I/O methods and prompt user to select one.
 static int camera_select_io_method(struct camera_device *camera, enum camera_io_method *selected_method)
 {
-        enum camera_io_method supported_methods[CAMERA_IO_READWRITE];
+        enum camera_io_method supported_methods[CAMERA_IO_METHOD_COUNT];
         size_t supported_count = 0;
         size_t index;
         uint32_t choice = 0;
@@ -1319,23 +1332,18 @@ static int camera_select_io_method(struct camera_device *camera, enum camera_io_
                 return -1;
         }
 
-        if (camera->capabilities & V4L2_CAP_STREAMING)
+        if (!(camera->capabilities & V4L2_CAP_STREAMING))
         {
-                supported_methods[supported_count] = CAMERA_IO_MMAP;
-                supported_count++;
-        }
-
-        if (camera->capabilities & V4L2_CAP_READWRITE)
-        {
-                supported_methods[supported_count] = CAMERA_IO_READWRITE;
-                supported_count++;
-        }
-
-        if (supported_count == 0)
-        {
-                fprintf(stderr, "%s Device supports neither streaming (MMAP) nor read/write I/O.\n", ERROR_PREFIX);
+                fprintf(stderr, "%s Device does not support V4L2_CAP_STREAMING.\n", ERROR_PREFIX);
                 return -1;
         }
+
+        supported_methods[supported_count] = CAMERA_IO_MMAP;
+        supported_count++;
+        supported_methods[supported_count] = CAMERA_IO_USERPTR;
+        supported_count++;
+        supported_methods[supported_count] = CAMERA_IO_DMABUF;
+        supported_count++;
 
         printf("\n========== I/O METHOD SELECTION ==========\n");
         for (index = 0; index < supported_count; index++)
@@ -1389,7 +1397,7 @@ static int camera_select_frame_count(uint32_t *frame_count)
         return 0;
 }
 
-// Configure capture I/O method and frame count after format and interval setup.
+// Configure streaming I/O method and frame count after format and interval setup.
 int camera_configure_capture(struct camera_device *camera, struct camera_capture_config *config)
 {
         enum camera_io_method method = CAMERA_IO_NONE;
@@ -1416,6 +1424,303 @@ int camera_configure_capture(struct camera_device *camera, struct camera_capture
 
         printf("\n%s Capture settings configured (Method: %s, Frames: %u).\n", STATUS_PREFIX, camera_io_method_name(config->io_method), config->frame_count);
         return 0;
+}
+
+// Map internal I/O method enum to V4L2 memory type.
+static enum v4l2_memory camera_io_to_v4l2_memory(enum camera_io_method method)
+{
+        if (method == CAMERA_IO_MMAP)
+        {
+                return V4L2_MEMORY_MMAP;
+        }
+
+        if (method == CAMERA_IO_USERPTR)
+        {
+                return V4L2_MEMORY_USERPTR;
+        }
+
+        if (method == CAMERA_IO_DMABUF)
+        {
+                return V4L2_MEMORY_DMABUF;
+        }
+
+        return (enum v4l2_memory)0;
+}
+
+// Round a byte size up to a required alignment boundary.
+static size_t camera_align_up_size(size_t size, size_t alignment)
+{
+        size_t remainder;
+
+        if (alignment == 0)
+        {
+                return size;
+        }
+
+        remainder = size % alignment;
+        if (remainder == 0)
+        {
+                return size;
+        }
+
+        return size + (alignment - remainder);
+}
+
+// Request V4L2 streaming buffers via VIDIOC_REQBUFS.
+static int camera_request_buffers(struct camera_device *camera, enum v4l2_memory memory, uint32_t *allocated_count)
+{
+        struct v4l2_requestbuffers req;
+
+        if (camera == NULL || camera->fd < 0 || allocated_count == NULL)
+        {
+                errno = EINVAL;
+                return -1;
+        }
+
+        memset(&req, 0, sizeof(req));
+        req.count = CAMERA_DEFAULT_BUFFER_COUNT;
+        req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        req.memory = memory;
+
+        if (camera_ioctl(camera->fd, VIDIOC_REQBUFS, &req) == -1)
+        {
+                perror("ERROR: VIDIOC_REQBUFS failed");
+                return -1;
+        }
+
+        if (req.count < CAMERA_MIN_BUFFER_COUNT)
+        {
+                fprintf(stderr, "%s Insufficient buffers allocated by driver (%u < %u).\n", ERROR_PREFIX, req.count, CAMERA_MIN_BUFFER_COUNT);
+                return -1;
+        }
+
+        *allocated_count = req.count;
+        printf("%s Driver allocated %u V4L2 buffers.\n", STATUS_PREFIX, *allocated_count);
+        return 0;
+}
+
+// Query and mmap buffers into user space for MMAP streaming.
+static int camera_init_mmap_buffers(struct camera_device *camera, struct camera_buffer_pool *pool)
+{
+        struct v4l2_buffer buf;
+        uint32_t i;
+
+        for (i = 0; i < pool->count; i++)
+        {
+                memset(&buf, 0, sizeof(buf));
+                buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                buf.memory = V4L2_MEMORY_MMAP;
+                buf.index = i;
+
+                if (camera_ioctl(camera->fd, VIDIOC_QUERYBUF, &buf) == -1)
+                {
+                        perror("ERROR: VIDIOC_QUERYBUF failed");
+                        return -1;
+                }
+
+                pool->buffers[i].length = buf.length;
+                pool->buffers[i].memory = V4L2_MEMORY_MMAP;
+                pool->buffers[i].dmabuf_fd = -1;
+                pool->buffers[i].index = i;
+                pool->buffers[i].start = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, camera->fd, buf.m.offset);
+
+                if (pool->buffers[i].start == MAP_FAILED)
+                {
+                        pool->buffers[i].start = NULL;
+                        perror("ERROR: mmap failed for V4L2 buffer");
+                        return -1;
+                }
+        }
+
+        printf("%s Mapped %u MMAP buffers successfully.\n", STATUS_PREFIX, pool->count);
+        return 0;
+}
+
+// Allocate page-aligned user-space buffers for USERPTR streaming.
+static int camera_init_userptr_buffers(struct camera_buffer_pool *pool, size_t frame_size)
+{
+        size_t aligned_size = camera_align_up_size(frame_size, CAMERA_BUFFER_ALIGNMENT);
+        uint32_t i;
+
+        for (i = 0; i < pool->count; i++)
+        {
+                pool->buffers[i].length = aligned_size;
+                pool->buffers[i].memory = V4L2_MEMORY_USERPTR;
+                pool->buffers[i].dmabuf_fd = -1;
+                pool->buffers[i].index = i;
+                pool->buffers[i].start = aligned_alloc(CAMERA_BUFFER_ALIGNMENT, aligned_size);
+
+                if (pool->buffers[i].start == NULL)
+                {
+                        perror("ERROR: aligned_alloc failed for USERPTR buffer");
+                        return -1;
+                }
+        }
+
+        printf("%s Allocated %u USERPTR buffers (%zu bytes each).\n", STATUS_PREFIX, pool->count, aligned_size);
+        return 0;
+}
+
+// Allocate DMA-BUF file descriptors from system heap for DMABUF streaming.
+static int camera_init_dmabuf_buffers(struct camera_buffer_pool *pool, size_t frame_size)
+{
+        struct dma_heap_allocation_data heap_data;
+        size_t aligned_size = camera_align_up_size(frame_size, CAMERA_BUFFER_ALIGNMENT);
+        int heap_fd;
+        uint32_t i;
+
+        heap_fd = open(CAMERA_DMA_HEAP_PATH, O_RDONLY);
+        if (heap_fd == -1)
+        {
+                perror("ERROR: Failed to open DMA heap device");
+                return -1;
+        }
+
+        for (i = 0; i < pool->count; i++)
+        {
+                memset(&heap_data, 0, sizeof(heap_data));
+                heap_data.len = aligned_size;
+                heap_data.fd_flags = O_RDWR;
+
+                if (camera_ioctl(heap_fd, DMA_HEAP_IOCTL_ALLOC, &heap_data) == -1)
+                {
+                        perror("ERROR: DMA_HEAP_IOCTL_ALLOC failed");
+                        close(heap_fd);
+                        return -1;
+                }
+
+                pool->buffers[i].length = aligned_size;
+                pool->buffers[i].memory = V4L2_MEMORY_DMABUF;
+                pool->buffers[i].dmabuf_fd = (int)heap_data.fd;
+                pool->buffers[i].start = NULL;
+                pool->buffers[i].index = i;
+        }
+
+        if (close(heap_fd) == -1)
+        {
+                perror("ERROR: Failed to close DMA heap descriptor");
+                return -1;
+        }
+
+        printf("%s Allocated %u DMABUF buffers (%zu bytes each).\n", STATUS_PREFIX, pool->count, aligned_size);
+        return 0;
+}
+
+// Allocate and initialize V4L2 buffers for the chosen I/O method.
+int camera_setup_buffers(struct camera_device *camera, const struct camera_capture_config *config, uint32_t frame_size, struct camera_buffer_pool *pool)
+{
+        enum v4l2_memory memory;
+        uint32_t count = 0;
+        uint32_t i;
+
+        if (camera == NULL || camera->fd < 0 || config == NULL || pool == NULL || frame_size == 0)
+        {
+                fprintf(stderr, "%s Invalid arguments for buffer setup.\n", ERROR_PREFIX);
+                return -1;
+        }
+
+        pool->buffers = NULL;
+        pool->count = 0;
+        pool->io_method = config->io_method;
+
+        memory = camera_io_to_v4l2_memory(config->io_method);
+        if (memory == (enum v4l2_memory)0)
+        {
+                fprintf(stderr, "%s Unsupported I/O method for buffer setup.\n", ERROR_PREFIX);
+                return -1;
+        }
+
+        printf("\n========== BUFFER SETUP ==========\n");
+
+        if (camera_request_buffers(camera, memory, &count) == -1)
+        {
+                return -1;
+        }
+
+        pool->buffers = calloc(count, sizeof(*pool->buffers));
+        if (pool->buffers == NULL)
+        {
+                perror("ERROR: Failed to allocate buffer tracking array");
+                return -1;
+        }
+
+        pool->count = count;
+        for (i = 0; i < pool->count; i++)
+        {
+                pool->buffers[i].dmabuf_fd = -1;
+                pool->buffers[i].memory = memory;
+                pool->buffers[i].index = i;
+        }
+
+        if (config->io_method == CAMERA_IO_MMAP)
+        {
+                if (camera_init_mmap_buffers(camera, pool) == -1)
+                {
+                        camera_release_buffers(pool);
+                        return -1;
+                }
+        }
+        else if (config->io_method == CAMERA_IO_USERPTR)
+        {
+                if (camera_init_userptr_buffers(pool, (size_t)frame_size) == -1)
+                {
+                        camera_release_buffers(pool);
+                        return -1;
+                }
+        }
+        else if (config->io_method == CAMERA_IO_DMABUF)
+        {
+                if (camera_init_dmabuf_buffers(pool, (size_t)frame_size) == -1)
+                {
+                        camera_release_buffers(pool);
+                        return -1;
+                }
+        }
+
+        printf("%s Buffer setup completed successfully.\n", STATUS_PREFIX);
+        return 0;
+}
+
+// Release all mapped, allocated, or DMA-BUF buffers and free pool storage.
+void camera_release_buffers(struct camera_buffer_pool *pool)
+{
+        uint32_t i;
+
+        if (pool == NULL || pool->buffers == NULL)
+        {
+                return;
+        }
+
+        for (i = 0; i < pool->count; i++)
+        {
+                if (pool->buffers[i].memory == V4L2_MEMORY_MMAP && pool->buffers[i].start != NULL && pool->buffers[i].length > 0)
+                {
+                        if (munmap(pool->buffers[i].start, pool->buffers[i].length) == -1)
+                        {
+                                perror("ERROR: munmap failed");
+                        }
+                        pool->buffers[i].start = NULL;
+                }
+                else if (pool->buffers[i].memory == V4L2_MEMORY_USERPTR && pool->buffers[i].start != NULL)
+                {
+                        free(pool->buffers[i].start);
+                        pool->buffers[i].start = NULL;
+                }
+                else if (pool->buffers[i].memory == V4L2_MEMORY_DMABUF && pool->buffers[i].dmabuf_fd >= 0)
+                {
+                        if (close(pool->buffers[i].dmabuf_fd) == -1)
+                        {
+                                perror("ERROR: Failed to close DMA buffer fd");
+                        }
+                        pool->buffers[i].dmabuf_fd = -1;
+                }
+        }
+
+        free(pool->buffers);
+        pool->buffers = NULL;
+        pool->count = 0;
+        pool->io_method = CAMERA_IO_NONE;
+        printf("%s Buffers released.\n", STATUS_PREFIX);
 }
 
 // Close open camera descriptor and reset device struct fields.
