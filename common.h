@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <ctype.h>
 
 #define APP_NAME "V4L2 Camera Capture Application"
 

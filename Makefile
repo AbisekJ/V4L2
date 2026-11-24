@@ -1,9 +1,7 @@
 CC = gcc
-
 CFLAGS = -Wall -Wextra -Werror -std=c11
 
 TARGET = camera_app
-
 SOURCES = main.c camera.c
 
 all: $(TARGET)
@@ -13,3 +11,5 @@ $(TARGET): $(SOURCES)
 
 clean:
 	rm -f $(TARGET)
+
+.PHONY: all clean
